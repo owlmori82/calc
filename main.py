@@ -16,19 +16,47 @@ def load_data(file_name):
 # データを保存する関数
 def save_data(df, file_name):
     df.to_csv(file_name, index=False)
+    
+#出題順の並び替え
+def sort_priority(sub_df):
+    # (1) 出題回数 0 のものを最優先（出題日が古い順）
+    pri_1 = sub_df[sub_df["TimesAsked"] == 0].sort_values(by=["DaysSinceLastAsked"])
 
+    # (2) 出題回数 2 回以下のもの（出題日が古い順）
+    pri_2 = sub_df[(sub_df["TimesAsked"] > 0) & (sub_df["TimesAsked"] <= 2)].sort_values(by=["DaysSinceLastAsked"])
+
+    # (3) 出題回数 3 回以上のもの（Accuracy が低く、出題日が古い順）
+    pri_3 = sub_df[sub_df["TimesAsked"] >= 3].sort_values(by=["Accuracy", "DaysSinceLastAsked"], ascending=[True, True])
+
+    # 優先順位で結合
+    return pd.concat([pri_1, pri_2, pri_3])
 
 # 出題順の決定
 def prioritize_questions(df):
     now = datetime.datetime.now()
+
+    # 出題回数を計算
+    df["TimesAsked"] = df["correct"] + df["incorrect"]
+
+    # 最終出題日からの日数を計算
     df["DaysSinceLastAsked"] = df["LastAsked"].apply(
         lambda x: (now - pd.to_datetime(x)).days if pd.notnull(x) else float("inf")
     )
-    df["Accuracy"] = df["correct"] / (df["correct"] + df["incorrect"])
-    df["Accuracy"] = df["Accuracy"].fillna(0)
-    df = df.sort_values(
-        by=["level","DaysSinceLastAsked", "Accuracy", "AverageTime"], ascending=[True,False, True, False]
-    ).drop(columns=["DaysSinceLastAsked"])
+
+    #level毎に上位10件と残りのレコードに分離して並べ替える
+    df_top = pd.DataFrame()
+    df_left = pd.DataFrame()
+    for level in df['level'].unique():
+        df_tmp = sort_priority(df[df['level'] == level])
+        df_top = pd.concat([df_top,df_tmp.head(10)])
+        df_left = pd.concat([df_left,df_tmp.iloc[10:]])
+    
+    # 分離したデータをまとめる
+    df = pd.concat([df_top,df_left])
+
+    # 不要な列を削除
+    df = df.drop(columns=["DaysSinceLastAsked", "TimesAsked"])
+
     return df
 
 # Streamlitアプリのメイン部分
@@ -44,6 +72,7 @@ def main():
     if (uploaded_file is not None) & (st.session_state.read_file == False):
         st.success("ファイルがアップロードされました。")
         df = pd.read_csv(uploaded_file)
+        st.session_state.df = prioritize_questions(df)
         save_data(df,data_path)
         st.session_state.read_file = True
     else:
@@ -59,12 +88,12 @@ def main():
         st.session_state.start_time = None
     if "current_index" not in st.session_state:
         st.session_state.current_index = 0
-        df = prioritize_questions(df)
+        st.session_state.df = prioritize_questions(df)
     if "Asked_time" not in st.session_state:
         st.session_state.Asked_time = 0
-    
+    df = st.session_state.df
     # 問題の出題
-    if (st.session_state.current_index < len(df)) & (st.session_state.Asked_time < 21):
+    if (st.session_state.current_index < len(df)) & (st.session_state.Asked_time < 31):
         current_question = df.iloc[st.session_state.current_index]
         st.write(f"**問題:** {current_question['question']}")
         st.session_state.start_time = time.time()
