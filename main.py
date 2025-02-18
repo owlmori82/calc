@@ -2,22 +2,47 @@ import streamlit as st
 import pandas as pd
 import datetime
 import time
-import os
+from supabase import create_client, Client
+from st_supabase_connection import SupabaseConnection
 
+# Supabaseの設定
+# Initialize connection.
+# Uses st.cache_resource to only run once.
+@st.cache_resource
+def init_connection():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+#    return st.connection("supabase",type=SupabaseConnection)
 
 # データを読み込む関数
-def load_data(file_name):
-    if os.path.exists(file_name):
-        return pd.read_csv(file_name, parse_dates=["LastAsked"])
-    else:
-        return pd.DataFrame(columns=["question", "answer", "correct", "incorrect", "AverageTime", "LastAsked"])
-
-
-# データを保存する関数
-def save_data(df, file_name):
-    df.to_csv(file_name, index=False)
+def load_data(conn,TABLE_NAME):
+    response = conn.table(TABLE_NAME).select("*").execute()
+    df = pd.DataFrame(data = response.data)
+    df["LastAsked"] = pd.to_datetime(df["LastAsked"])
+    return df
     
-#出題順の並び替え
+    
+# データを保存する関数
+def save_data(df,conn,TABLE_NAME):
+    df_tmp = df.copy()
+    df_tmp["LastAsked"] = df_tmp["LastAsked"].astype(str)
+    df_tmp = df_tmp.astype({
+    "id": "int64",
+    "level": "int64",
+    "question": "string",  # 文字列型を明示
+    "answer": "int64",
+    "correct": "int64",
+    "incorrect": "int64",
+    "AverageTime": "float64",
+    "LastAsked": "string",  # ISO 8601 形式に変換済みの文字列
+    "Accuracy": "float64"
+    })
+    for _, row in df_tmp.iterrows():
+        #st.write(row.to_dict())
+        conn.table(TABLE_NAME).upsert(row.to_dict()).execute()
+
+# 出題順の並び替え
 def sort_priority(sub_df):
     # (1) 出題回数 0 のものを最優先（出題日が古い順）
     pri_1 = sub_df[sub_df["TimesAsked"] == 0].sort_values(by=["DaysSinceLastAsked"])
@@ -31,120 +56,115 @@ def sort_priority(sub_df):
     # 優先順位で結合
     return pd.concat([pri_1, pri_2, pri_3])
 
-# 出題順の決定
+#回答結果を更新
+def update_data(rec,df):
+    # 更新前のデータ型を保存
+    rec["LastAsked"] = datetime.datetime.now()
+    df = df.astype(str)
+    update_row = pd.DataFrame(rec,index = rec.index).T.astype(str)
+    df = pd.concat([df,update_row])
+    return df
+
 def prioritize_questions(df):
     now = datetime.datetime.now()
-
-    # 出題回数を計算
     df["TimesAsked"] = df["correct"] + df["incorrect"]
-
-    # 最終出題日からの日数を計算
-    df["DaysSinceLastAsked"] = df["LastAsked"].apply(
-        lambda x: (now - pd.to_datetime(x)).days if pd.notnull(x) else float("inf")
-    )
-
-    #level毎に上位10件と残りのレコードに分離して並べ替える
+    df["DaysSinceLastAsked"] = df["LastAsked"].apply(lambda x: (now - x).days if pd.notnull(x) else float("inf"))
+    
     df_top = pd.DataFrame()
     df_left = pd.DataFrame()
-    for level in df['level'].unique():
-        df_tmp = sort_priority(df[df['level'] == level])
-        df_top = pd.concat([df_top,df_tmp.head(10)])
-        df_left = pd.concat([df_left,df_tmp.iloc[10:]])
+    for level in df["level"].unique():
+        df_tmp = sort_priority(df[df["level"] == level])
+        df_top = pd.concat([df_top, df_tmp.head(10)])
+        df_left = pd.concat([df_left, df_tmp.iloc[10:]])
     
-    # 分離したデータをまとめる
-    df = pd.concat([df_top,df_left])
-
-    # 不要な列を削除
+    df = pd.concat([df_top, df_left])
     df = df.drop(columns=["DaysSinceLastAsked", "TimesAsked"])
-
     return df
 
 # Streamlitアプリのメイン部分
 def main():
     st.title("計算力強化アプリ")
- 
-    uploaded_file = st.file_uploader("ファイルをアップロードしてください（例: flash_card.csv）", type=["csv"])
-    data_path = "./data/flash_card.csv"
     
+    #初期化
     if "read_file" not in st.session_state:
         st.session_state.read_file = False
-        
-    if (uploaded_file is not None) & (st.session_state.read_file == False):
-        st.success("ファイルがアップロードされました。")
-        df = pd.read_csv(uploaded_file)
-        st.session_state.df = prioritize_questions(df)
-        save_data(df,data_path)
-        st.session_state.read_file = True
-    else:
-        st.info("デフォルトのファイル (./data/flash_card.csv) を使用します。")
-        try:
-            df = load_data(data_path)
-        except FileNotFoundError:
-            st.error("デフォルトのファイルが見つかりません。アプリを終了します。")
-            st.stop()
-
-    # セッション状態の初期化
+    if "data" not in st.session_state:
+        st.session_state.data = None
     if "start_time" not in st.session_state:
         st.session_state.start_time = None
     if "current_index" not in st.session_state:
         st.session_state.current_index = 0
-        st.session_state.df = prioritize_questions(df)
     if "Asked_time" not in st.session_state:
         st.session_state.Asked_time = 0
-    df = st.session_state.df
-    # 問題の出題
-    if (st.session_state.current_index < len(df)) & (st.session_state.Asked_time < 31):
-        current_question = df.iloc[st.session_state.current_index]
+    if "update_data" not in st.session_state:
+        st.session_state.update_data = pd.DataFrame(columns=['id','level','question','answer','correct','incorrect','AverageTime','LastAsked','Accuracy'])
+    
+    #データベースから取得
+    conn = init_connection()
+    TABLE_NAME = "flashcards"
+    #データベースから取得して初期ロード
+    if st.session_state.read_file == False:
+        st.session_state.data = load_data(conn,TABLE_NAME)
+        st.session_state.data = prioritize_questions(st.session_state.data)
+        st.session_state.read_file = True
+    #問題の優先順を変更して出題する    
+    if (st.session_state.current_index < len(st.session_state.data)) & (st.session_state.Asked_time < 31):
+        current_question = st.session_state.data.iloc[st.session_state.current_index]
         st.write(f"**問題:** {current_question['question']}")
         st.session_state.start_time = time.time()
-        st.session_state.Asked_time += 1
-        
-        # 回答入力
-        with st.form(key = 'input_answer',clear_on_submit=True):
+               
+        with st.form(key='input_answer', clear_on_submit=True):
             answer = st.text_input("答えを入力してください")
-    
             submit_button = st.form_submit_button("回答を送信")
+            
             if submit_button:
                 end_time = time.time()
                 response_time = end_time - st.session_state.start_time
-            
+                
                 if str(answer) == str(current_question["answer"]):
                     st.success("正解！")
-                    df.loc[st.session_state.current_index, "correct"] += 1
+                    current_question["correct"] += 1
                     time.sleep(1)
                 else:
                     st.error(f"不正解！正解は {current_question['answer']} です。")
-                    df.loc[st.session_state.current_index, "incorrect"] += 1
+                    current_question["incorrect"] += 1
                     time.sleep(2)
-                # 平均時間の更新
-                current_avg_time = df.loc[st.session_state.current_index, "AverageTime"]
-                df.loc[st.session_state.current_index, "AverageTime"] = (
-                    (current_avg_time * (df.loc[st.session_state.current_index, "correct"] +
-                                        df.loc[st.session_state.current_index, "incorrect"] ) + response_time)
-                    / (df.loc[st.session_state.current_index, "correct"] + df.loc[st.session_state.current_index, "incorrect"])
+                
+                current_avg_time = current_question["AverageTime"]
+                current_question["AverageTime"] = (
+                    (current_avg_time * (current_question["correct"] + current_question["incorrect"] ) + response_time)
+                    / (current_question["correct"] + current_question["incorrect"])
                 )
-                df.loc[st.session_state.current_index, "LastAsked"] = datetime.datetime.now()
-                save_data(df, data_path)
+                st.session_state.Asked_time += 1
+                st.session_state.update_data = update_data(current_question,st.session_state.update_data)
                 st.session_state.current_index += 1
-                st.rerun()    
+                st.rerun()
     else:
-        st.write("すべての問題が終了しました！")
+        st.write("すべての問題が終了しました！終了ボタンを押してください。")
 
-    # 結果のダウンロード
-    st.download_button(
-        label="結果をダウンロード",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="updated_questions.csv",
-        mime="text/csv"
-    )
-
-    # 終了ボタン
+    #finish
     if st.button("終了"):
-        save_data(df, data_path)
+        save_data(st.session_state.update_data,conn,TABLE_NAME)
         st.session_state.read_file = False
         st.success("記録を保存しました！お疲れ様でした。")
         st.stop()
-
-
+    
+    st.write("--------メンテナンス----------------")
+    #ファイルのアップロード
+    uploaded_file = st.file_uploader("データを更新するときはファイルをアップロードしてください", type=["csv"])
+        
+    #uploadファイルがあるときはそのファイルでデフォルトデータを更新する。    
+    if  uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+        save_data(df,conn,TABLE_NAME)
+        st.success("ファイルがアップロードされ、データが更新されました。")
+        
+    st.download_button(
+        label="結果をダウンロード",
+        data=st.session_state.data.to_csv(index=False).encode("utf-8"),
+        file_name="updated_questions.csv",
+        mime="text/csv"
+    )
+    
 if __name__ == "__main__":
     main()
